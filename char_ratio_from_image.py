@@ -384,6 +384,22 @@ def _run_at(mask: bytearray, w: int, y: int, x: int) -> Optional[Tuple[int, int]
     return lo, hi
 
 
+def _box_fg_ratio(mask: bytearray, w: int, h: int,
+                  x: int, y: int, bw: int, bh: int, step: int = 4) -> float:
+    """框内前景像素占比（抽样，step 像素一步）。用来判断这个脸框是不是落在剪影里。"""
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(w, x + bw), min(h, y + bh)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    hit = tot = 0
+    for yy in range(y0, y1, step):
+        base = yy * w
+        for xx in range(x0, x1, step):
+            tot += 1
+            hit += mask[base + xx]
+    return hit / float(tot) if tot else 0.0
+
+
 def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
             shoulder_band: float, face_rects=None,
             pose: Optional[Dict[str, Any]] = None,
@@ -439,18 +455,25 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
     if face_rects is not None and len(face_rects):
         limit = top_y + (foot_y - top_y + 1) * 0.40
         sho_y = pose.get("shoulder_y") if pose else None
+        n_off = 0
         for cand in face_rects:
-            cy, ch = int(cand[1]), int(cand[3])
-            if cy + ch > limit:
+            fx, fy, fw, fh = (int(v) for v in cand)
+            # ③ 框必须落在剪影里：设定集 / 三视图在四角还摆着头部特写，人脸检测会照单
+            #    全收，但那些特写是独立连通块、不在 mask（最大连通块）内——用前景占比
+            #    一刀切掉，免得下巴线被锚到角上的特写上。
+            if _box_fg_ratio(mask, w, h, fx, fy, fw, fh) < 0.45:
+                n_off += 1
                 continue
-            if sho_y is not None and cy + ch * 0.70 > sho_y + ch * 0.10:
+            if fy + fh > limit:
+                continue
+            if sho_y is not None and fy + fh * 0.70 > sho_y + fh * 0.10:
                 continue
             face_rect = cand
             break
         if face_rect is None:
-            warn.append("检到 %d 个人脸框，没有一个在合理位置（脸跑到身体下半部或肩线以下）——"
-                        "当成误检丢掉了，改用轮廓几何找颈，结果务必对着标注图确认"
-                        % len(face_rects))
+            why = ("（%d 个落在剪影外，像是设定集角上的头部特写）" % n_off) if n_off else ""
+            warn.append("检到 %d 个人脸框，没有一个可用%s——当成误检丢掉了，"
+                        "改用轮廓几何找颈，结果务必对着标注图确认" % (len(face_rects), why))
 
     # --- 核心：基于面部识别锚定人类头骨（无视兽耳/呆毛/帽子） ---
     chin_src = "检不出，回退到颈最窄线"
