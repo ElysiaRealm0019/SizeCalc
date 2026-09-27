@@ -1,0 +1,8 @@
+Pillow>=10.0.0
+rembg>=2.0.0
+onnxruntime>=1.16.0
+PySide6>=6.5.0
+opencv-python<5.0.0
+
+# 可选：开 --pose 后用 YOLO 骨架关键点量肩宽（不装则自动退回剪影法）
+# ultralytics>=8.3.0
