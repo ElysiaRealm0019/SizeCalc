@@ -4,5 +4,7 @@ onnxruntime>=1.16.0
 PySide6>=6.5.0
 opencv-python<5.0.0
 
-# 可选：开 --pose 后用 YOLO 骨架关键点量肩宽（不装则自动退回剪影法）
+# 可选：开 --pose 后用 YOLO 姿态关键点量肩宽（不装则自动退回剪影法）。
+# 注意 ultralytics 会拉最新 opencv-python（现在可能是 5.x，会导致人脸锚定失效），
+# 装完请确认仍是 4.x，或再跑一次：pip install "opencv-python<5.0.0"
 # ultralytics>=8.3.0

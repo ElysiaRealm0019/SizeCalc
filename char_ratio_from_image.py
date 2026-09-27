@@ -45,12 +45,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
-import struct
-import subprocess
 import sys
-import tempfile
-import zlib
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -64,257 +59,57 @@ except ImportError:  # pragma: no cover
     cv2 = None  # type: ignore
     _np = None  # type: ignore
 
-
-# ---------------------------------------------------------------------------
-# PNG 解码（纯标准库）
-# ---------------------------------------------------------------------------
-def _paeth(a: int, b: int, c: int) -> int:
-    p = a + b - c
-    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-    if pa <= pb and pa <= pc:
-        return a
-    return b if pb <= pc else c
-
-
-def _defilter(raw: bytes, height: int, stride: int, bpp: int) -> bytearray:
-    out = bytearray(height * stride)
-    prev = bytearray(stride)
-    pos = 0
-    for y in range(height):
-        ft = raw[pos]
-        pos += 1
-        line = bytearray(raw[pos:pos + stride])
-        pos += stride
-        if ft == 1:
-            for i in range(bpp, stride):
-                line[i] = (line[i] + line[i - bpp]) & 0xFF
-        elif ft == 2:
-            for i in range(stride):
-                line[i] = (line[i] + prev[i]) & 0xFF
-        elif ft == 3:
-            for i in range(stride):
-                a = line[i - bpp] if i >= bpp else 0
-                line[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xFF
-        elif ft == 4:
-            for i in range(stride):
-                a = line[i - bpp] if i >= bpp else 0
-                c = prev[i - bpp] if i >= bpp else 0
-                line[i] = (line[i] + _paeth(a, prev[i], c)) & 0xFF
-        elif ft != 0:
-            raise ValueError("PNG 滤波类型 %d 不认识" % ft)
-        out[y * stride:(y + 1) * stride] = line
-        prev = line
-    return out
-
-
-def _unpack_bits(data: bytearray, width: int, height: int, stride: int,
-                 depth: int, channels: int) -> List[List[int]]:
-    """把 <8 位的采样展开成每像素一个整数列表（按通道交错）。"""
-    per_row = width * channels
-    mask = (1 << depth) - 1
-    rows = []
-    for y in range(height):
-        base = y * stride
-        vals = []
-        bit = 0
-        for _ in range(per_row):
-            byte = data[base + (bit >> 3)]
-            shift = 8 - depth - (bit & 7)
-            vals.append((byte >> shift) & mask)
-            bit += depth
-        rows.append(vals)
-    return rows
-
-
-def decode_png(path: str) -> Tuple[int, int, bytearray]:
-    """返回 (宽, 高, RGBA bytearray)。只支持非隔行 PNG。"""
-    with open(path, "rb") as f:
-        data = f.read()
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("不是 PNG 文件")
-
-    pos = 8
-    idat = bytearray()
-    palette = b""
-    trns = b""
-    w = h = depth = ctype = interlace = 0
-    while pos < len(data):
-        (length,) = struct.unpack(">I", data[pos:pos + 4])
-        ctag = data[pos + 4:pos + 8]
-        body = data[pos + 8:pos + 8 + length]
-        pos += 12 + length
-        if ctag == b"IHDR":
-            w, h, depth, ctype, _, _, interlace = struct.unpack(">IIBBBBB", body)
-        elif ctag == b"PLTE":
-            palette = body
-        elif ctag == b"tRNS":
-            trns = body
-        elif ctag == b"IDAT":
-            idat += body
-        elif ctag == b"IEND":
-            break
-
-    if interlace:
-        raise ValueError("隔行 PNG 暂不支持（脚本会自动用 sips 转一遍再试）")
-
-    ch = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[ctype]
-    stride = (w * ch * depth + 7) // 8
-    bpp = max(1, (ch * depth) // 8)
-    raw = _defilter(zlib.decompress(bytes(idat)), h, stride, bpp)
-
-    rgba = bytearray(w * h * 4)
-
-    if depth < 8:
-        rows = _unpack_bits(raw, w, h, stride, depth, ch)
-        scale = 255 // ((1 << depth) - 1)
-        for y in range(h):
-            row = rows[y]
-            o = y * w * 4
-            for x in range(w):
-                if ctype == 3:
-                    idx = row[x]
-                    r, g, b = palette[idx * 3:idx * 3 + 3]
-                    a = trns[idx] if idx < len(trns) else 255
-                else:
-                    r = g = b = row[x] * scale
-                    a = 255
-                rgba[o:o + 4] = bytes((r, g, b, a))
-                o += 4
-        return w, h, rgba
-
-    step = depth // 8          # 8bit→1, 16bit→2（16 位只取高字节）
-    for y in range(h):
-        src = y * stride
-        o = y * w * 4
-        for x in range(w):
-            s = src + x * ch * step
-            if ctype == 0:
-                v = raw[s]
-                rgba[o:o + 4] = bytes((v, v, v, 255))
-            elif ctype == 2:
-                rgba[o:o + 4] = bytes((raw[s], raw[s + step], raw[s + 2 * step], 255))
-            elif ctype == 3:
-                idx = raw[s]
-                rgba[o:o + 3] = palette[idx * 3:idx * 3 + 3]
-                rgba[o + 3] = trns[idx] if idx < len(trns) else 255
-            elif ctype == 4:
-                v = raw[s]
-                rgba[o:o + 4] = bytes((v, v, v, raw[s + step]))
-            else:
-                rgba[o:o + 4] = bytes((raw[s], raw[s + step],
-                                       raw[s + 2 * step], raw[s + 3 * step]))
-            o += 4
-    return w, h, rgba
-
-
-def write_png(path: str, w: int, h: int, rgba: bytearray) -> None:
-    stride = w * 4
-    raw = bytearray()
-    for y in range(h):
-        raw.append(0)
-        raw += rgba[y * stride:(y + 1) * stride]
-
-    def chunk(tag: bytes, body: bytes) -> bytes:
-        return (struct.pack(">I", len(body)) + tag + body
-                + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF))
-
-    with open(path, "wb") as f:
-        f.write(b"\x89PNG\r\n\x1a\n")
-        f.write(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)))
-        f.write(chunk(b"IDAT", zlib.compress(bytes(raw), 6)))
-        f.write(chunk(b"IEND", b""))
+# 缩放时给「较短边」留的最小工作宽度：竖长条/横长条图不至于被压成一条糊线。
+MIN_WORK_SIDE = 320
 
 
 # ---------------------------------------------------------------------------
-# 载图：Pillow → 原生 PNG → sips 转码
+# 载图（Pillow）
 # ---------------------------------------------------------------------------
 def load_image(path: str, max_dim: int, use_rembg: bool = True,
                rembg_model: str = "isnet-anime") -> Tuple[int, int, bytearray, float, str]:
-    """返回 (工作宽, 工作高, RGBA, 缩放系数 原图/工作图, 走的哪条路)。"""
+    """返回 (工作宽, 工作高, RGBA, 缩放系数 原图/工作图, 说明)。"""
     if not os.path.exists(path):
         raise SystemExit("找不到文件：%s" % path)
 
-    # 1) Pillow
     try:
         from PIL import Image  # type: ignore
-        im = Image.open(path).convert("RGBA")
-        
-        rembg_msg = ""
-        if use_rembg:
-            try:
-                import rembg
-                # rembg 默认的 u2net 是在真实照片上训的显著性模型，对动漫立绘会
-                # 吃掉大片色块：尹琳那张双马尾、披风、半条手臂全被抹掉，前景只剩
-                # 正常值的一半，头宽直接量成 47 px。isnet-anime 是动漫专训的，
-                # 同一张图前景多出 88%，另外四张测试图差异都在 1% 以内。
-                try:
-                    from rembg import new_session  # type: ignore
-                    im = rembg.remove(im, session=new_session(rembg_model))
-                    rembg_msg = " + rembg 抠图（%s）" % rembg_model
-                except Exception:
-                    im = rembg.remove(im)
-                    rembg_msg = " + rembg 抠图（回退到默认模型）"
-            except ImportError:
-                pass
-                
-        ow, oh = im.size
-        scale = max(1.0, max(ow, oh) / float(max_dim))
-        if scale > 1.0:
-            im = im.resize((max(1, int(ow / scale)), max(1, int(oh / scale))))
-        return im.size[0], im.size[1], bytearray(im.tobytes()), scale, "Pillow" + rembg_msg
     except ImportError:
-        pass
+        raise SystemExit("需要 Pillow 才能读图：pip3 install Pillow")
 
-    # 2) 原生解码 PNG（先看原图多大，太大就交给 sips 缩）
-    def native(p: str) -> Tuple[int, int, bytearray]:
-        return decode_png(p)
+    im = Image.open(path).convert("RGBA")
 
-    sips = shutil.which("sips")
-    try:
-        if path.lower().endswith(".png"):
-            with open(path, "rb") as f:
-                head = f.read(33)
-            ow, oh = struct.unpack(">II", head[16:24])
-            if max(ow, oh) <= max_dim:
-                w, h, rgba = native(path)
-                return w, h, rgba, 1.0, "原生 PNG 解码"
-    except Exception:
-        pass
+    rembg_msg = ""
+    if use_rembg:
+        try:
+            import rembg
+            # rembg 默认的 u2net 是在真实照片上训的显著性模型，对动漫立绘会吃掉
+            # 大片色块（尹琳那张双马尾、披风、半条手臂全被抹掉，头宽量成一半）。
+            # isnet-anime 是动漫专训的，同一张图前景多出 88%。
+            try:
+                from rembg import new_session  # type: ignore
+                im = rembg.remove(im, session=new_session(rembg_model))
+                rembg_msg = " + rembg 抠图（%s）" % rembg_model
+            except Exception:
+                im = rembg.remove(im)
+                rembg_msg = " + rembg 抠图（回退到默认模型）"
+        except ImportError:
+            pass
 
-    # 3) sips：任意格式 → 缩放后的 PNG → 原生解码
-    if not sips:
-        raise SystemExit(
-            "无法读取该图片：没有 Pillow，也没找到 sips。\n"
-            "装一个 Pillow 即可：pip3 install --user Pillow"
-        )
-    tmpdir = tempfile.mkdtemp(prefix="charratio_")
-    tmp = os.path.join(tmpdir, "work.png")
-    try:
-        subprocess.run(
-            [sips, "-s", "format", "png", "-Z", str(max_dim), path, "--out", tmp],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-    except subprocess.CalledProcessError:
-        raise SystemExit("sips 无法转换该文件，请确认它是一张图片：%s" % path)
-    w, h, rgba = native(tmp)
-    # 用 sips 查原图尺寸算缩放系数
-    scale = 1.0
-    try:
-        out = subprocess.run([sips, "-g", "pixelWidth", "-g", "pixelHeight", path],
-                             capture_output=True, text=True, check=True).stdout
-        ow = oh = 0
-        for ln in out.splitlines():
-            if "pixelWidth:" in ln:
-                ow = int(ln.split(":")[1])
-            elif "pixelHeight:" in ln:
-                oh = int(ln.split(":")[1])
-        if ow and oh:
-            scale = max(ow / float(w), oh / float(h))
-    except Exception:
-        pass
-    shutil.rmtree(tmpdir, ignore_errors=True)
-    return w, h, rgba, scale, "sips 转码 + 原生解码"
+    ow, oh = im.size
+    scale = max(1.0, max(ow, oh) / float(max_dim))
+    # 竖长条图（如 483×2176）按「最长边→max_dim」会把这窄边压成 177 宽，细节全糊。
+    # 给窄边留个下限，否则下巴/肩线会量偏。
+    if scale > 1.0:
+        scale = max(1.0, min(scale, min(ow, oh) / float(MIN_WORK_SIDE)))
+        im = im.resize((max(1, int(ow / scale)), max(1, int(oh / scale))))
+    return im.size[0], im.size[1], bytearray(im.tobytes()), scale, "Pillow" + rembg_msg
 
+
+def save_rgba(path: str, w: int, h: int, rgba: bytearray) -> None:
+    """把 RGBA 字节存成 PNG（标注图用）。"""
+    from PIL import Image  # type: ignore
+    Image.frombytes("RGBA", (w, h), bytes(rgba)).save(path)
 
 # ---------------------------------------------------------------------------
 # 抠图
@@ -507,7 +302,14 @@ def detect_pose(path: str, scale: float, models: List[str],
     except ImportError:
         return None
 
-    im = Image.open(path).convert("RGB")
+    src = Image.open(path)
+    # 透明背景直接 convert("RGB") 会变成黑底，姿态模型在黑底上容易误判，先铺白。
+    if src.mode in ("RGBA", "LA") or (src.mode == "P" and "transparency" in src.info):
+        rgba = src.convert("RGBA")
+        im = Image.new("RGB", rgba.size, (255, 255, 255))
+        im.paste(rgba, mask=rgba.split()[-1])
+    else:
+        im = src.convert("RGB")
     # 小图会让关键点乱跳（实测 290×410 那张，放大到 3× 才收敛），先垫到 900px
     mult = 1
     while max(im.size) * mult < 900:
@@ -756,13 +558,37 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
     shoulder_w = float(width[sh_y])
     shoulder_span = (left[sh_y], right[sh_y])
     shoulder_src = "剪影外轮廓·肩线（≠ 肩峰距，厚衣服会明显偏大）"
+    shoulder_sil_w = shoulder_w                 # 剪影估计值，骨架不可信时的兜底
 
-    # 有骨架就用骨架：主脚本要的 shoulder_width 就是两肩峰点直线距离
-    if pose and "shoulder_w" in pose:
-        shoulder_w = float(pose["shoulder_w"])
-        shoulder_span = pose["shoulder_span"]
-        sh_y = max(0, min(h - 1, int(pose["shoulder_y"])))
-        shoulder_src = "YOLO-pose 肩峰关键点 (%s)" % pose["model"]
+    # 骨架肩宽：定义上对（肩峰距），但动漫立绘是姿态模型的域外输入，实测常把肩点
+    # 定到脖子 / 衣领上（值偏小）。用两条下限把关，判为不可信就回退剪影并告警，
+    # 两个值都报出来交给用户定夺。
+    pose_shoulder = float(pose["shoulder_w"]) if (pose and "shoulder_w" in pose) else None
+    pose_shoulder_span = pose["shoulder_span"] if pose_shoulder is not None else None
+    pose_shoulder_y = None
+    used_pose = False
+    if pose_shoulder is not None:
+        body_h = max(1, foot_y - top_y + 1)
+        span_h = pose_shoulder / body_h
+        span_head = pose_shoulder / max(1.0, head_w)
+        pose_shoulder_y = max(0, min(h - 1, int(pose["shoulder_y"])))
+        # 两条下限都是「肩峰距」的硬约束：不能比含发头宽还窄，也不能太小于身高。
+        # 动漫立绘里姿态模型最常见的失败就是把肩点定到脖子 / 衣领上（值偏小），
+        # 这两条正好卡住那种情况；宽肩厚衣（值偏大）交给剪影去兜。
+        plausible = (0.13 <= span_h <= 0.35) and (1.20 <= span_head <= 3.0)
+        if plausible:
+            shoulder_w = pose_shoulder
+            shoulder_span = pose_shoulder_span
+            sh_y = pose_shoulder_y
+            shoulder_src = "YOLO-pose 肩峰关键点 (%s)" % pose["model"]
+            used_pose = True
+        else:
+            warn.append(
+                "骨架肩宽 %.0f px（身高的 %.0f%%、含发头宽的 %.2f 倍）不像正常肩峰距"
+                "（肩应明显宽于含发头宽，且不低于身高的一成多）——动漫立绘是姿态模型的域外输入，"
+                "这次多半把肩点定到了脖子 / 衣领上。已改用剪影肩线 %.0f px；"
+                "要骨架值就 --shoulder-w %.0f，或对着标注图手动量"
+                % (pose_shoulder, span_h * 100, span_head, shoulder_w, pose_shoulder))
 
     if ov.get("shoulder_w") is not None:
         shoulder_w = float(ov["shoulder_w"])
@@ -788,15 +614,23 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
     # 这条只在剪影模式下有意义：剪影量的是外轮廓，头和肩是同一套定义，肩反而更窄
     # 就说明肩线被头发盖了。骨架模式下肩宽是肩峰距、头宽是含发外轮廓，本来就不是
     # 同一套尺——大头身的动漫角色 head_w > shoulder_w 是正常的（上面的 r 区间会兜底）。
-    if shoulder_w <= head_w and not (pose and "shoulder_w" in pose):
+    if shoulder_w <= head_w and not used_pose:
         warn.append("肩比头还窄（肩 %d px ≤ 头 %d px）——长发把肩线盖住了，"
                     "量到的多半是头发不是肩膀，建议 --shoulder-w 手动给"
                     % (shoulder_w, head_w))
     if (shoulder_w > head_w * 2.2 and ov.get("shoulder_w") is None
-            and not (pose and "shoulder_w" in pose)):
+            and not used_pose):
         warn.append("肩宽 %.0f px 是头宽 %.0f px 的 %.1f 倍——多半量到了毛领/披风/翅膀这类"
                     "外挂物，不是肩峰距，建议 --pose 或 --shoulder-w 手动给"
                     % (shoulder_w, head_w, shoulder_w / max(1.0, head_w)))
+    # 画面裁切检测：竖长条 / 截图裁出来的立绘，头或肩会被画框切掉，量到的是「画框宽」
+    # 而不是角色宽。这种图自动值没意义，必须手动给或换未裁切的全身图。
+    if left[hw_y] <= 0 or right[hw_y] >= w - 1:
+        warn.append("头宽那一行顶到了画面左右边缘——立绘被横向裁切了，头宽量到的是画框宽、偏小；"
+                    "建议换未裁切的全身图，或用 --head-w 手动给")
+    if not used_pose and (left[sh_y] <= 0 or right[sh_y] >= w - 1):
+        warn.append("肩宽那一行顶到了画面左右边缘——立绘被横向裁切了，肩宽量到的是画框宽，"
+                    "不是角色肩宽；请用 --shoulder-w 手动给，或换未裁切的全身图")
 
     return {
         "top_y": top_y, "chin_y": chin_y, "neck_y": neck_y, "foot_y": foot_y,
@@ -805,6 +639,11 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
         "head_w_px": head_w, "shoulder_w_px": shoulder_w, "neck_w_px": neck_w,
         "head_span": head_span,
         "shoulder_span": shoulder_span,
+        "shoulder_sil_px": shoulder_sil_w,
+        "pose_shoulder_px": pose_shoulder,
+        "pose_shoulder_span": pose_shoulder_span,
+        "pose_shoulder_y": pose_shoulder_y,
+        "used_pose": used_pose,
         "ratio": n_ratio, "head_shoulder": r_ratio,
         "ratio_lo": n_lo, "ratio_hi": n_hi,
         "width_profile": width, "left": left, "right": right,
@@ -823,6 +662,7 @@ BLUE = (58, 132, 232)
 GREEN = (46, 184, 106)
 ORANGE = (240, 150, 40)
 GRAY = (150, 150, 150)
+PURPLE = (150, 60, 200)
 
 
 def annotate(w: int, h: int, rgba: bytearray, m: Dict[str, Any]) -> bytearray:
@@ -864,6 +704,14 @@ def annotate(w: int, h: int, rgba: bytearray, m: Dict[str, Any]) -> bytearray:
     hline(m["shoulder_y"], sl, sr, ORANGE, 3)
     vtick(sl, m["shoulder_y"], ORANGE)
     vtick(sr, m["shoulder_y"], ORANGE)
+
+    # 骨架肩线（紫色）：即便最终判定不可信也画出来，方便和橙色的剪影肩线对照
+    if m.get("pose_shoulder_span"):
+        pl, pr = m["pose_shoulder_span"]
+        py = m["pose_shoulder_y"]
+        hline(py, pl, pr, PURPLE, 3)
+        vtick(pl, py, PURPLE)
+        vtick(pr, py, PURPLE)
 
     # 左边缘画宽度剖面曲线，方便看分割对不对
     prof = m["width_profile"]
@@ -953,7 +801,7 @@ def main(argv: List[str]) -> int:
     out_path = None
     if not a.no_annotate:
         out_path = a.out or (os.path.splitext(a.image)[0] + "_analysis.png")
-        write_png(out_path, w, h, annotate(w, h, rgba, m))
+        save_rgba(out_path, w, h, annotate(w, h, rgba, m))
 
     result = {
         "图片": a.image,
@@ -978,6 +826,9 @@ def main(argv: List[str]) -> int:
         "下巴线来源": m["chin_src"],
         "脚底线来源": m["foot_src"],
         "肩宽来源": m["shoulder_src"],
+        "剪影肩宽_px": round(m["shoulder_sil_px"], 1),
+        "骨架肩宽_px": round(m["pose_shoulder_px"], 1) if m.get("pose_shoulder_px") else None,
+        "是否采用骨架": bool(m.get("used_pose")),
         "标注图": out_path,
         "警告": m["warnings"],
     }
@@ -1002,6 +853,10 @@ def main(argv: List[str]) -> int:
     print("  下巴线来源：%s" % result["下巴线来源"])
     print("  脚底线来源：%s" % result["脚底线来源"])
     print("  肩宽来源：  %s" % result["肩宽来源"])
+    if m.get("pose_shoulder_px") is not None:
+        print("  骨架肩宽 %.0f px vs 剪影肩线 %.0f px → %s"
+              % (m["pose_shoulder_px"], m["shoulder_sil_px"],
+                 "本次采用骨架" if m.get("used_pose") else "骨架判为不可信，已回退剪影"))
 
     print()
     print(ln("★ 结果"))
@@ -1019,7 +874,8 @@ def main(argv: List[str]) -> int:
         print()
         print(ln("标注图"))
         print("  %s" % out_path)
-        print("  红线=头顶/下巴   蓝线=脚底   灰细线=颈最窄   绿=头宽   橙=肩宽")
+        print("  红线=头顶/下巴   蓝线=脚底   灰细线=颈最窄   绿=头宽   橙=肩宽(采用值)")
+        print("  紫=骨架肩线（--pose 时画出，供对照；和橙色对不上就说明骨架这次跑偏了）")
         print("  左边灰曲线是逐行剪影宽度剖面，四条线对不对一眼就能看出来。")
 
     if m["warnings"]:
