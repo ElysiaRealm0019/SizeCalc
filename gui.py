@@ -136,20 +136,43 @@ class KiguApp(QMainWindow):
         if not self.chk_rembg.isChecked():
             cmd.append("--no-rembg")
             
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            self.analysis_out.setPlainText(result.stdout)
-            
-            n_match = re.search(r"N = .*? = ([\d\.]+)", result.stdout)
-            r_match = re.search(r"r = .*? = ([\d\.]+)", result.stdout)
-            if n_match:
-                self.inputs["ratio"].setText(n_match.group(1))
-            if r_match:
-                self.inputs["head_shoulder"].setText(r_match.group(1))
+            result = subprocess.run(cmd, capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace",
+                                    env=env, check=True)
+            # stderr 里有人脸锚定失败等关键提示，一并展示，别让用户看不到
+            text = result.stdout
+            if result.stderr.strip():
+                text += "\n" + result.stderr
+            self.analysis_out.setPlainText(text)
+
+            n_val = self._last_float_on_line(result.stdout, "N =")
+            r_val = self._last_float_on_line(result.stdout, "r =")
+            if n_val:
+                self.inputs["ratio"].setText(n_val)
+            if r_val:
+                self.inputs["head_shoulder"].setText(r_val)
+            if n_val or r_val:
                 self.analysis_out.append("\n✨ 已将提取到的比例参数自动同步至右侧测算面板！\n(请注意辨别头宽比例是否受到长发/袖子干扰)")
-                
+
         except subprocess.CalledProcessError as e:
             self.analysis_out.setPlainText(f"❌ 执行失败:\n{e.stderr}\n{e.stdout}")
+
+    @staticmethod
+    def _last_float_on_line(text, marker):
+        """取含 marker 的那一行里最后一个数字。
+
+        例：'头身比  N = 全身高 / 头高 = 656 / 80 = 8.20' → '8.20'。
+        （旧正则 r"N = .*? = ([\\d\\.]+)" 会抓到第 3 个数 656，是错的。）
+        """
+        for line in text.splitlines():
+            if marker in line:
+                nums = re.findall(r"\d+(?:\.\d+)?", line)
+                if nums:
+                    return nums[-1]
+        return None
 
     def run_calc(self):
         self.calc_out.clear()

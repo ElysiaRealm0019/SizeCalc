@@ -44,7 +44,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import cv2
 import os
 import shutil
 import struct
@@ -54,6 +53,16 @@ import tempfile
 import zlib
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
+
+# 人脸锚定只是「剪影法」之上的可选增强：装了 OpenCV 才启用。
+# 没装（或装的是移除了 CascadeClassifier 的 OpenCV 5.x）时退化为纯剪影法，
+# 主流程会明确打印原因，绝不静默吞掉。
+try:  # pragma: no cover - 取决于运行环境
+    import cv2  # type: ignore
+    import numpy as _np  # type: ignore
+except ImportError:  # pragma: no cover
+    cv2 = None  # type: ignore
+    _np = None  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +438,50 @@ def build_mask(w: int, h: int, rgba: bytearray, alpha_thr: int,
 
 
 # ---------------------------------------------------------------------------
+# 人脸锚定（可选增强，需要 OpenCV）
+# ---------------------------------------------------------------------------
+def face_backend_note() -> str:
+    """返回当前环境下人脸锚定是否可用的说明；可用时返回空串。"""
+    if cv2 is None or _np is None:
+        return ("未安装 opencv-python：人脸锚定不可用，将退回纯剪影法"
+                "（长发/兽耳会明显拉低下巴线精度）。装：pip install \"opencv-python<5.0.0\"")
+    if not hasattr(cv2, "CascadeClassifier"):
+        return ("当前 OpenCV %s 已移除 cv2.CascadeClassifier（5.x 起不再提供），人脸锚定不可用，"
+                "将退回纯剪影法。请改装 pip install \"opencv-python<5.0.0\"，或用 --chin-y 手动给下巴线"
+                % getattr(cv2, "__version__", "?"))
+    return ""
+
+
+def detect_faces(w: int, h: int, rgba: bytearray) -> Tuple[Optional[List[Tuple[int, int, int, int]]], str]:
+    """用动漫人脸级联找脸框。返回 (按 y 从上到下排序的框列表 或 None, 提示信息)。
+
+    返回 None 表示没拿到脸框；提示信息解释原因（绝不会静默失败）。
+    """
+    note = face_backend_note()
+    if note:
+        return None, note
+
+    cascade_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "lbpcascade_animeface.xml")
+    if not os.path.exists(cascade_path):
+        return None, "找不到 lbpcascade_animeface.xml，人脸锚定不可用，退回纯剪影法"
+
+    try:
+        cascade = cv2.CascadeClassifier(cascade_path)
+        if cascade.empty():
+            return None, "lbpcascade_animeface.xml 加载失败（文件损坏？），退回纯剪影法"
+        nparr = _np.frombuffer(bytes(rgba), dtype=_np.uint8).reshape((h, w, 4))
+        gray = cv2.cvtColor(nparr, cv2.COLOR_RGBA2GRAY)
+        faces = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(24, 24))
+    except Exception as e:      # 关键：不静默。把真实异常带出去，别让它悄悄退化成垃圾结果。
+        return None, "人脸检测出错（%s: %s），退回纯剪影法" % (type(e).__name__, e)
+
+    if len(faces) == 0:
+        return None, "人脸检测没找到任何脸框，退回纯剪影法（下巴线可能不准，必要时 --chin-y 手动给）"
+    return sorted([tuple(int(v) for v in f) for f in faces], key=lambda f: f[1]), ""
+
+
+# ---------------------------------------------------------------------------
 # 姿态估计（可选）：YOLO-pose 给骨架关键点
 # ---------------------------------------------------------------------------
 # COCO-17 里我们只关心这四个点
@@ -531,7 +584,8 @@ def _run_at(mask: bytearray, w: int, y: int, x: int) -> Optional[Tuple[int, int]
 
 def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
             shoulder_band: float, face_rects=None,
-            pose: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            pose: Optional[Dict[str, Any]] = None,
+            head_cap: float = 1.45) -> Dict[str, Any]:
     warn: List[str] = []
     if pose:
         warn.extend(pose.get("warnings", []))
@@ -672,8 +726,9 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
     head_w = float(width[hw_y])
     head_span = (left[hw_y], right[hw_y])
     if face_rect is not None:
-        # 大毛领 / 双马尾能让剪影宽出头骨好几倍，用人脸框宽度封顶
-        cap = float(face_rect[2]) * 1.30
+        # 大毛领 / 双马尾能让剪影宽出头骨好几倍，用人脸框宽度封顶。
+        # 系数太小会把宽头发（银灰那种）也一起削掉，所以默认放到 1.45，可用 --head-cap 调。
+        cap = float(face_rect[2]) * head_cap
         if head_w > cap:
             head_w = cap
             cx = face_rect[0] + face_rect[2] / 2.0
@@ -683,19 +738,24 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
         cx = (head_span[0] + head_span[1]) / 2.0
         head_span = (int(cx - head_w / 2), int(cx + head_w / 2))
 
-    # --- 肩宽：下巴下方 0.25 ~ shoulder_band 头高 的带内「中位宽度」那一行 ---
-    # 取带内最大宽必然高估：外套下摆、垂发、袖子在这一段是一路往外张的，最大值
-    # 永远落在带的最下沿。中位数对这种单调外扩稳健得多。
+    # --- 肩宽：先找「肩线」再量，而不是在带里取中位宽度 ---
+    # 下巴往下，剪影先经过脖子/衣领，再在肩膀处快速外扩。取带内宽度增长最快的那一行
+    # 当肩线。比「带内中位宽」更贴近真正的肩点，也不会一路滑到外套下摆 / 披风最宽处。
     s0 = min(h - 1, chin_y + max(2, int(head_h * 0.25)))
     s1 = min(h - 1, chin_y + max(4, int(head_h * shoulder_band)))
     if s1 <= s0:
         s1 = min(h - 1, s0 + 3)
-    band = [y for y in range(s0, s1 + 1) if width[y] > 0] or [s0]
-    band.sort(key=lambda y: width[y])
-    sh_y = band[len(band) // 2]
+    sw = max(1, int(head_h * 0.06))              # 平滑一下，免得噪声行冒充肩线
+    sm_w = []
+    for y in range(s0, s1 + 1):
+        lo = max(0, y - sw)
+        hi = min(h - 1, y + sw)
+        sm_w.append(sum(width[lo:hi + 1]) / float(hi - lo + 1))
+    grad = [sm_w[i + 1] - sm_w[i] for i in range(len(sm_w) - 1)]
+    sh_y = s0 + (max(range(len(grad)), key=lambda i: grad[i]) if grad else 0)
     shoulder_w = float(width[sh_y])
     shoulder_span = (left[sh_y], right[sh_y])
-    shoulder_src = "剪影外轮廓（≠ 肩峰距，厚衣服会明显偏大）"
+    shoulder_src = "剪影外轮廓·肩线（≠ 肩峰距，厚衣服会明显偏大）"
 
     # 有骨架就用骨架：主脚本要的 shoulder_width 就是两肩峰点直线距离
     if pose and "shoulder_w" in pose:
@@ -732,6 +792,11 @@ def analyse(w: int, h: int, mask: bytearray, ov: Dict[str, Optional[float]],
         warn.append("肩比头还窄（肩 %d px ≤ 头 %d px）——长发把肩线盖住了，"
                     "量到的多半是头发不是肩膀，建议 --shoulder-w 手动给"
                     % (shoulder_w, head_w))
+    if (shoulder_w > head_w * 2.2 and ov.get("shoulder_w") is None
+            and not (pose and "shoulder_w" in pose)):
+        warn.append("肩宽 %.0f px 是头宽 %.0f px 的 %.1f 倍——多半量到了毛领/披风/翅膀这类"
+                    "外挂物，不是肩峰距，建议 --pose 或 --shoulder-w 手动给"
+                    % (shoulder_w, head_w, shoulder_w / max(1.0, head_w)))
 
     return {
         "top_y": top_y, "chin_y": chin_y, "neck_y": neck_y, "foot_y": foot_y,
@@ -827,6 +892,9 @@ def main(argv: List[str]) -> int:
                    help="无透明通道时的背景色容差，抠不干净就调大 (默认 30)")
     p.add_argument("--shoulder-band", type=float, default=0.6,
                    help="肩线搜索带的下沿 = 下巴下方 N × 头高，上沿固定 0.25 (默认 0.6)")
+    p.add_argument("--head-cap", type=float, default=1.45,
+                   help="头宽封顶 = 人脸框宽 × 它，防止毛领/双马尾把剪影头宽撑爆 (默认 1.45；"
+                        "宽发角色可调大，窄脸可调小)")
 
     g = p.add_argument_group("手动覆盖（像素值按原图坐标）")
     g.add_argument("--top-y", type=float, help="头顶线 y")
@@ -861,23 +929,10 @@ def main(argv: List[str]) -> int:
         ov[k] = None if v is None else v / scale
 
     
-    # --- 面部识别回退逻辑 ---
-    face_rects = None
-    try:
-        import cv2
-        import numpy as np
-        cascade_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lbpcascade_animeface.xml")
-        if os.path.exists(cascade_path):
-            cascade = cv2.CascadeClassifier(cascade_path)
-            # rgba to grayscale for cv2
-            np_img = np.array(rgba).reshape((h, w, 4))
-            gray = cv2.cvtColor(np_img, cv2.COLOR_RGBA2GRAY)
-            faces = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(24, 24))
-            if len(faces) > 0:
-                # 全部候选按从上到下排，交给 analyse() 用解剖学约束筛
-                face_rects = sorted(faces, key=lambda f: f[1])
-    except Exception as e:
-        pass
+    # --- 人脸锚定（可选增强；拿不到就明确说明，不静默退化）---
+    face_rects, face_note = detect_faces(w, h, rgba)
+    if face_note:
+        print("⚠ " + face_note, file=sys.stderr)
 
     pose = None
     if a.pose:
@@ -890,7 +945,10 @@ def main(argv: List[str]) -> int:
                   "  pip3 install --user ultralytics\n"
                   "  这次先按剪影法算。\n", file=sys.stderr)
 
-    m = analyse(w, h, mask, ov, a.shoulder_band, face_rects, pose)
+    m = analyse(w, h, mask, ov, a.shoulder_band, face_rects, pose, a.head_cap)
+    if face_note:
+        # 人脸锚定失败是头高误差的主因，把它顶到结果警告最前面
+        m["warnings"].insert(0, face_note)
 
     out_path = None
     if not a.no_annotate:
